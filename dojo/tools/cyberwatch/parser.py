@@ -348,26 +348,64 @@ class CyberwatchParser:
 
     def global_version_dedup(self, findings):
         """
-        Ensure no version appears more than once across all findings for the same product.
-        If a version repeats in a subsequent finding for the same product, remove it.
+        Deduplicate (product, version) pairs across all findings.
         """
-        product_versions_seen = {}
-        for finding in findings:
-            product = getattr(finding, "component_name", None)
-            component_version = getattr(finding, "component_version", None)
-            if product and component_version and component_version != "N/A":
-                if product not in product_versions_seen:
-                    product_versions_seen[product] = set()
 
-                versions = [v.strip() for v in component_version.split(",")]
-                unique_versions = [v for v in versions if v not in product_versions_seen[product]]
+        # Assign each finding a "before_sort" index so we can restore original order.
+        for idx, f in enumerate(findings):
+            f._original_index = idx
 
-                # Update product_versions_seen
-                for v in unique_versions:
-                    product_versions_seen[product].add(v)
+        severity_priority_map = {
+            'Critical': 4,
+            'High': 3,
+            'Medium': 2,
+            'Low': 1,
+            'Info': 0
+        }
+        def severity_priority(sev):
+            return severity_priority_map.get(sev, 0)
 
-                # If no unique version left, set to None
-                finding.component_version = ", ".join(unique_versions) if unique_versions else None
+        findings.sort(key=lambda f: severity_priority(f.severity), reverse=True)
+
+        # Track used versions by product name across ALL severities
+        used_versions = {} 
+
+        for f in findings:
+            product = getattr(f, "component_name", None)
+            if not product:
+                continue
+
+            component_version = getattr(f, "component_version", None)
+            if not component_version or component_version == "N/A":
+                continue
+
+            product_lower = product.lower()
+
+            # Initialize if not present
+            if product_lower not in used_versions:
+                used_versions[product_lower] = set()
+
+            # For each version in the comma-separated string, remove from the final if previously used
+            versions_list = [v.strip() for v in component_version.split(",") if v.strip()]
+
+            unique_versions = []
+            for ver in versions_list:
+                if ver not in used_versions[product_lower]:
+                    unique_versions.append(ver)
+                    used_versions[product_lower].add(ver)
+
+            if unique_versions:
+                f.component_version = ", ".join(unique_versions)
+            else:
+                # All were duplicates, so set to None
+                f.component_version = None
+
+        # Sort findings back to original order
+        findings.sort(key=lambda f: f._original_index)
+
+        # Clean up the temporary index attribute
+        for f in findings:
+            del f._original_index
 
     def process_security_issue(self, json_data, test):
         """
