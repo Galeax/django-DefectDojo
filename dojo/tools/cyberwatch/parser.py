@@ -10,6 +10,7 @@ from dojo.models import Finding, Endpoint, Endpoint_Status
 
 logger = logging.getLogger(__name__)
 
+
 class CyberwatchParser:
     def get_scan_types(self):
         return ["Cyberwatch scan"]
@@ -22,47 +23,34 @@ class CyberwatchParser:
 
     def get_findings(self, filename, test):
         """
-        Main entry point. Reads the file line by line, processes CVEs and security issues:
-        - Accumulates CVE data for all lines first.
-        - Processes security issues directly as they are independent.
-        - After processing all lines, builds findings for CVEs and combines them with security issue findings.
-        - Applies a global version deduplication step at the end.
+        Main entry point.
+        Expects the file to contain a proper JSON document with two keys:
+            - "cves": [ { ... }, { ... }, ... ]
+            - "security_issues": [ { ... }, { ... }, ... ]
+        Processes all CVE entries and Security Issue entries.
         """
         logger.debug(f"Starting get_findings with filename: {filename}")
         try:
             file_content = self.read_file_content(filename)
-            lines = file_content.splitlines()
+            data = json.loads(file_content)
 
             cve_data = {}
             security_issue_findings = []
 
-            # Process each line
-            for line in lines:
-                if not line.strip():
-                    continue
-                json_data = self.safe_parse_json(line)
-                if not json_data:
-                    continue
+            for cve in data.get("cves", []):
+                self.collect_cve_data(cve, cve_data)
 
-                entry_type = json_data.get("type", "").lower()
-                if entry_type == "cve":
-                    self.collect_cve_data(json_data, cve_data)
-                elif entry_type == "security issue":
-                    si_finding = self.process_security_issue(json_data, test)
-                    if si_finding:
-                        security_issue_findings.append(si_finding)
-                else:
-                    logger.error(f"Unknown type '{json_data.get('type')}' in JSON line.")
+            for security_issue in data.get("security_issues", []):
+                si_finding = self.process_security_issue(security_issue, test)
+                if si_finding:
+                    security_issue_findings.append(si_finding)
 
-            # Build CVE findings after accumulating all data
             cve_findings = []
             for cve_code, c_data in cve_data.items():
                 cve_findings.extend(self.build_findings_for_cve(cve_code, c_data, test))
 
-            # Combine all findings
             all_findings = cve_findings + security_issue_findings
 
-            # Deduplicate versions globally
             self.global_version_dedup(all_findings)
 
             return all_findings
@@ -78,59 +66,55 @@ class CyberwatchParser:
             with open(filename, 'r', encoding='utf-8') as f:
                 return f.read()
 
-    def safe_parse_json(self, line):
-        """Safely parse a single line of JSON, logging and skipping invalid lines."""
-        if not line.strip():
-            return None
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError as e:
-            logger.error(f"Error decoding JSON line: {e}")
-            return None
-
     def collect_cve_data(self, json_data, cve_data):
         """
-        Accumulates CVE data across multiple lines.
-        If updates_assets are present, associate products, endpoints, and versions.
-        If no updates_assets, store endpoints in no_product_endpoints.
+        Accumulates CVE data across multiple entries.
+        If updates_assets are present, associates products, endpoints, and versions.
+        If no updates_assets, stores endpoints in no_product_endpoints.
         """
         cve_code = json_data.get("cve_code")
         if not cve_code:
-            logger.warning("No cve_code found, skipping line.")
+            logger.warning("No cve_code found, skipping entry.")
             return
 
-        # Extract and parse top-level CVE fields
         cve_score = json_data.get("cve_score", "N/A")
         cve_published_at = json_data.get("cve_published_at", "N/A")
         exploit_code_maturity = json_data.get("exploit_code_maturity", "N/A")
         updated_at_str = json_data.get("updated_at", "N/A")
         cve_epss = json_data.get("cve_epss", "N/A")
         cvss_v3_vector = json_data.get("cvss_v3")
-
-        updated_at = self.parse_datetime(updated_at_str)
+        cwes = json_data.get("cwes", [])
         cvssv3, cvssv3_score, severity = self.parse_cvss(cvss_v3_vector, json_data)
 
+        if not isinstance(cwes, list):
+            logger.error(f"Invalid 'cwes' data: {cwes}")
+            cwes = []
+        if cwes:
+            try:
+                primary_cwe = int(cwes[0])
+            except ValueError:
+                primary_cwe = None
+            additional_cwes = cwes[1:] if len(cwes) > 1 else []
+        else:
+            primary_cwe = None
+            additional_cwes = []
+        
+        impact = ""
+        
         description = (
             f"CVE Score: {cve_score}\n"
             f"CVE Published At: {cve_published_at}\n"
             f"Exploit Code Maturity: {exploit_code_maturity}\n"
             f"EPSS: {cve_epss}\n"
+            f"Parent CWE:{','.join([f'CWE-{cwe}' for cwe in additional_cwes])}\n"
         )
-
-        cwes = json_data.get("cwes", {})
-        if not isinstance(cwes, dict):
-            logger.error(f"Invalid 'cwes' data: {cwes}")
-            cwes = {}
-        cwe_id = cwes.get("cwe_id")
-        cwe_num = self.extract_cwe_num(cwe_id)
-
-        impact = f"CWE ID: {cwe_id or 'N/A'}\n"
+        
         references = f"Updated At: {updated_at_str}"
 
-        # Initialize CVE data if not present
         if cve_code not in cve_data:
             cve_data[cve_code] = {
-                "cwe_num": cwe_num,
+                "cwe_num": primary_cwe,
+                "additional_cwes": additional_cwes,
                 "epss": cve_epss if cve_epss != "N/A" else None,
                 "severity": severity,
                 "description": description,
@@ -143,8 +127,7 @@ class CyberwatchParser:
             }
 
         c_data = cve_data[cve_code]
-        # Update CVE-level info if needed
-        c_data["cwe_num"] = c_data["cwe_num"] or cwe_num
+        c_data["cwe_num"] = c_data["cwe_num"] or primary_cwe
         if cve_epss != "N/A":
             c_data["epss"] = cve_epss
         c_data["severity"] = severity
@@ -154,7 +137,6 @@ class CyberwatchParser:
         c_data["cvssv3"] = cvssv3
         c_data["cvssv3_score"] = cvssv3_score
 
-        # Handle servers and updates_assets
         servers = json_data.get("servers", [])
         if not isinstance(servers, list):
             logger.error(f"'servers' is not a list: {servers}")
@@ -166,7 +148,6 @@ class CyberwatchParser:
         if updates_assets:
             self.collect_products_data(updates_assets, server_lookup, c_data)
         else:
-            # No products - just gather endpoints
             for server_name in server_lookup.keys():
                 c_data["no_product_endpoints"].add(server_name)
 
@@ -206,18 +187,18 @@ class CyberwatchParser:
 
                 p_data["endpoints"].add(asset)
 
-            # Determine overall mitigated_date for this product in this line
             mitigated_date = None if active_status else (max(mitigated_dates) if mitigated_dates else None)
             p_data["active_mitigated_data"].append((active_status, mitigated_date))
 
     def build_findings_for_cve(self, cve_code, c_data, test):
         """
-        Builds findings for a single CVE:
-        - If no products, create one mitigated finding with no_product_endpoints.
-        - Otherwise, one finding per product.
+        Builds findings for a single CVE.
+          - If no products, creates one finding using no_product_endpoints.
+          - Otherwise, one finding per product.
         """
         findings = []
         cwe_num = c_data["cwe_num"]
+        additional_cwes = c_data.get("additional_cwes", [])
         epss = c_data["epss"]
         severity = c_data["severity"]
         description = c_data["description"]
@@ -228,7 +209,6 @@ class CyberwatchParser:
         products = c_data["products"]
 
         if not products:
-            # No products: create a mitigated finding with the CVE code as title
             mitigated_date = datetime.now()
             mitigation = f"Fixed At: {mitigated_date}"
             endpoints = [Endpoint(host=e) for e in c_data["no_product_endpoints"]]
@@ -249,12 +229,12 @@ class CyberwatchParser:
                     endpoints=endpoints,
                     cwe_num=cwe_num,
                     epss=epss,
-                    cve_code=cve_code
+                    cve_code=cve_code,
+                    additional_cwes=additional_cwes
                 )
             )
             return findings
 
-        # Normal case: one finding per product
         for product, p_data in products.items():
             component_version_str, active_status, mitigated_date = self.determine_product_finding_state(p_data)
             mitigation = "No mitigation provided."
@@ -281,7 +261,8 @@ class CyberwatchParser:
                     epss=epss,
                     cve_code=cve_code,
                     component_name=product,
-                    component_version=component_version_str
+                    component_version=component_version_str,
+                    additional_cwes=additional_cwes
                 )
             )
 
@@ -290,9 +271,9 @@ class CyberwatchParser:
     def determine_product_finding_state(self, p_data):
         """
         Given product data (endpoints, versions, active_mitigated_data), determine:
-        - component_version_str
-        - active_status
-        - mitigated_date
+            - component_version_str
+            - active_status
+            - mitigated_date
         """
         unique_versions = sorted(p_data["versions"])
         component_version_str = ", ".join(unique_versions) if unique_versions else "N/A"
@@ -308,7 +289,8 @@ class CyberwatchParser:
 
     def create_finding(self, title, test, description, severity, mitigation, impact, references,
                        active, mitigated, cvssv3, cvssv3_score, endpoints,
-                       cwe_num=None, epss=None, cve_code=None, component_name=None, component_version=None):
+                       cwe_num=None, epss=None, cve_code=None, component_name=None, component_version=None,
+                       additional_cwes=None):
         """
         Helper to create a Finding object with all the common attributes.
         """
@@ -339,7 +321,7 @@ class CyberwatchParser:
 
         if cve_code:
             finding.unsaved_vulnerability_ids = [cve_code]
-        if cwe_num:
+        if cwe_num is not None:
             finding.cwe = cwe_num
         if epss:
             finding.epss_score = epss
@@ -350,8 +332,6 @@ class CyberwatchParser:
         """
         Deduplicate (product, version) pairs across all findings.
         """
-
-        # Assign each finding a "before_sort" index so we can restore original order.
         for idx, f in enumerate(findings):
             f._original_index = idx
 
@@ -362,13 +342,13 @@ class CyberwatchParser:
             'Low': 1,
             'Info': 0
         }
+
         def severity_priority(sev):
             return severity_priority_map.get(sev, 0)
 
         findings.sort(key=lambda f: severity_priority(f.severity), reverse=True)
 
-        # Track used versions by product name across ALL severities
-        used_versions = {} 
+        used_versions = {}
 
         for f in findings:
             product = getattr(f, "component_name", None)
@@ -381,11 +361,9 @@ class CyberwatchParser:
 
             product_lower = product.lower()
 
-            # Initialize if not present
             if product_lower not in used_versions:
                 used_versions[product_lower] = set()
 
-            # For each version in the comma-separated string, remove from the final if previously used
             versions_list = [v.strip() for v in component_version.split(",") if v.strip()]
 
             unique_versions = []
@@ -397,19 +375,16 @@ class CyberwatchParser:
             if unique_versions:
                 f.component_version = ", ".join(unique_versions)
             else:
-                # All were duplicates, so set to None
                 f.component_version = None
 
-        # Sort findings back to original order
         findings.sort(key=lambda f: f._original_index)
 
-        # Clean up the temporary index attribute
         for f in findings:
             del f._original_index
 
     def process_security_issue(self, json_data, test):
         """
-        Process a single security issue line, returning one Finding.
+        Process a single security issue entry, returning one Finding.
         """
         if not json_data:
             logger.error("json_data is None or empty")
@@ -419,7 +394,7 @@ class CyberwatchParser:
         security_issue_title = json_data.get("security_issue_title", "No Title")
         description = json_data.get("security_issue_description", "")
         severity = self.convert_severity(json_data.get("level", "Info"))
-        mitigation = "No mitigation provided."        
+        mitigation = "No mitigation provided."
         cve_announcements = json_data.get("cve_announcements", [])
         references = "CVE Announcements:\n" + "\n".join(cve_announcements) if cve_announcements else ""
 
@@ -459,7 +434,7 @@ class CyberwatchParser:
 
         if cve_announcements:
             finding.unsaved_vulnerability_ids = cve_announcements
-                
+
         finding.unsaved_endpoints = unsaved_endpoints
         for endpoint_status in unsaved_endpoint_status:
             endpoint_status.finding = finding
@@ -509,7 +484,6 @@ class CyberwatchParser:
             )
             unsaved_endpoint_status.append(endpoint_status)
 
-        # Determine overall mitigated_date for the security issue
         if not active_status:
             mitigated_date = max(mitigated_dates) if mitigated_dates else datetime.now()
         else:
@@ -556,18 +530,8 @@ class CyberwatchParser:
                 return cvssv3, cvssv3_score, severity
             else:
                 logger.error(f"Invalid CVSS v3 vector: {cvss_v3_vector}")
-        # Fall back
         severity = self.convert_severity(json_data.get("cve_level", "Info"))
         return None, None, severity
-
-    def extract_cwe_num(self, cwe_id):
-        """Extract numerical CWE from a CWE-ID string."""
-        if cwe_id and cwe_id.startswith("CWE-"):
-            try:
-                return int(cwe_id.replace("CWE-", ""))
-            except ValueError:
-                logger.error(f"Invalid CWE ID format: {cwe_id}")
-        return None
 
     def convert_severity(self, severity):
         severity_mapping = {
