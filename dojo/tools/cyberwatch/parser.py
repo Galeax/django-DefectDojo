@@ -83,32 +83,45 @@ class CyberwatchParser:
         updated_at_str = json_data.get("updated_at", "N/A")
         cve_epss = json_data.get("cve_epss", "N/A")
         cvss_v3_vector = json_data.get("cvss_v3")
-        cwes = json_data.get("cwes", [])
         cvssv3, cvssv3_score, severity = self.parse_cvss(cvss_v3_vector, json_data)
 
-        if not isinstance(cwes, list):
+        # Safely handle when "cwes" is null
+        cwes = json_data.get("cwes") or {}
+        if not isinstance(cwes, dict):
             logger.error(f"Invalid 'cwes' data: {cwes}")
-            cwes = []
-        if cwes:
+            cwes = {}
+
+        cwes_ids = cwes.get("cwe_id", [])
+        if not isinstance(cwes_ids, list):
+            logger.error(f"Invalid 'cwe_id' data: {cwes_ids}")
+            cwes_ids = []
+        if cwes_ids:
             try:
-                primary_cwe = int(cwes[0])
+                primary_cwe = int(cwes_ids[0])
             except ValueError:
                 primary_cwe = None
-            additional_cwes = cwes[1:] if len(cwes) > 1 else []
+            additional_cwes = cwes_ids[1:] if len(cwes_ids) > 1 else []
         else:
             primary_cwe = None
             additional_cwes = []
-        
+
         impact = ""
-        
+
+        # Use default empty list for capecs and attacks if they are missing
+        cwe_capecs = ','.join(cwes.get("capecs", []))
+        cwe_ttp = ','.join(cwes.get("attacks", []))
+
         description = (
-            f"CVE Score: {cve_score}\n"
+            f"CVSS Base vector: {cvssv3}\n"
+            f"CVSS Base score: {cve_score}\n"
             f"CVE Published At: {cve_published_at}\n"
             f"Exploit Code Maturity: {exploit_code_maturity}\n"
             f"EPSS: {cve_epss}\n"
             f"Parent CWE:{','.join([f'CWE-{cwe}' for cwe in additional_cwes])}\n"
+            f"CAPECS: {cwe_capecs}\n"
+            f"TTP: {cwe_ttp}\n"
         )
-        
+
         references = f"Updated At: {updated_at_str}"
 
         if cve_code not in cve_data:
@@ -288,9 +301,9 @@ class CyberwatchParser:
         return component_version_str, active_status, mitigated_date
 
     def create_finding(self, title, test, description, severity, mitigation, impact, references,
-                       active, mitigated, cvssv3, cvssv3_score, endpoints,
-                       cwe_num=None, epss=None, cve_code=None, component_name=None, component_version=None,
-                       additional_cwes=None):
+                    active, mitigated, cvssv3, cvssv3_score, endpoints,
+                    cwe_num=None, epss=None, cve_code=None, component_name=None, component_version=None,
+                    additional_cwes=None):
         """
         Helper to create a Finding object with all the common attributes.
         """
@@ -323,11 +336,18 @@ class CyberwatchParser:
             finding.unsaved_vulnerability_ids = [cve_code]
         if cwe_num is not None:
             finding.cwe = cwe_num
-        if epss:
+        if epss and epss != "N/A":
+            try:
+                epss_float = float(epss)
+                finding.epss_score = epss_float 
+            except Exception as e:
+                logger.error(f"Error converting epss score to percentage: {epss}")
+                finding.epss_score = epss
+        else:
             finding.epss_score = epss
 
         return finding
-
+    
     def global_version_dedup(self, findings):
         """
         Deduplicate (product, version) pairs across all findings.
